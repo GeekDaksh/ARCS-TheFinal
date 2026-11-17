@@ -3,7 +3,10 @@ Validation suite for Component 9 — fire until destroyed, then stop.
 
 The mission fires, learns from each miss, and ends the instant a round lands
 within an ADAPTABLE lethal radius (the "destroyed" criterion is a parameter),
-with a safety cap so it can never fire forever. run_engagement is untouched.
+with a safety cap so it can never fire forever.
+
+REDESIGN: shot 1 registers (full miss observed); shot 2 is the one-step Newton
+kill shot — the two-shot kill — so a default-radius mission destroys on round 2.
 """
 
 import os
@@ -44,10 +47,12 @@ def db():
 # Layer 1 — Stops when destroyed (core proof)
 # ---------------------------------------------------------------------------
 def test_layer1_stops_on_destruction():
-    r = fire(lethal_radius_m=8.0, max_rounds=15, min_learning_rounds=2)
+    r = fire(lethal_radius_m=8.0, max_rounds=15)
     assert r["destroyed"] is True
     assert r["rounds_fired"] < r["max_rounds"]            # stopped early on success
-    assert r["rounds_fired"] > r["min_learning_rounds"]   # had to learn first
+    # Two-shot kill: shot 1 registers, shot 2 fires for effect and destroys.
+    assert r["destroying_round"] == 2
+    assert r["rounds_fired"] == 2
     # The mission ended ON the destroying round (no extra rounds fired).
     assert r["destroying_round"] == r["rounds_fired"]
     kill = r["history"][-1]

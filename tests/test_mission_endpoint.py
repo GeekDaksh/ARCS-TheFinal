@@ -50,6 +50,11 @@ def test_completeness():
         assert isinstance(r["miss_m"], float)
         assert len(r["trajectory"][0]) == 3             # [x, y, z]
     lr = m["learned"]
+    # Honest telemetry: the TOTAL correction (gun bias + met error, combined).
+    assert len(lr["total_correction_est"]) == 2 and len(lr["total_correction_true"]) == 2
+    # learned total matches the true total error (valid because met is stable).
+    assert np.allclose(lr["total_correction_est"], lr["total_correction_true"], atol=12.0)
+    # Back-compat keys retained for the API contract.
     assert len(lr["gun_bias_est"]) == 2 and len(lr["gun_bias_true"]) == 2
     assert len(lr["atmo_correction_est"]) == 2 and len(lr["atmo_correction_true"]) == 2
 

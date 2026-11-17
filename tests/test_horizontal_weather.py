@@ -137,17 +137,18 @@ GUN_BIAS = (200.0, 80.0)
 def test_layer3_learns_unmeasured_target_weather_and_converges():
     res = run_engagement("WH", R, 0.0, TOLD_FIELD,
                          {"true_met": TRUE_FIELD, "gun_bias": GUN_BIAS})
-    adj0 = res["phase_misses"]["ADJUSTMENT"][0]
-    # The first aimed shot misses badly because the target-area weather was
-    # wrong and unmeasured...
-    assert adj0 > 100.0, adj0
-    # ...then the system learns the effective downrange conditions from fall of
-    # shot and converges to a tight group — without ever measuring the target.
+    open0 = res["phase_misses"]["REGISTRATION"][0]
+    # The opening registration shot misses badly because the target-area weather
+    # was wrong and unmeasured (plus the gun bias)...
+    assert open0 > 100.0, open0
+    # ...then one Newton correction learns the effective downrange conditions from
+    # fall of shot and converges to a tight group — without measuring the target.
     assert res["final_cep"] < 15.0, res["final_cep"]
-    assert res["final_cep"] < 0.15 * adj0
-    # The gun bias is still recovered (the separate estimator is not confused by
-    # the horizontal weather error).
-    assert np.allclose(res["gun_bias_est"], GUN_BIAS, atol=12.0), res["gun_bias_est"]
+    assert res["final_cep"] < 0.15 * open0
+    # The TOTAL correction (downrange weather error + gun bias, combined) is
+    # recovered. We do not claim to split the two from the impacts.
+    assert np.allclose(res["total_correction_est"], res["total_correction_true"],
+                       atol=12.0), res["total_correction_est"]
 
 
 def test_layer3_converges_with_observation_noise():
@@ -156,10 +157,11 @@ def test_layer3_converges_with_observation_noise():
     res = run_engagement("WH", R, 0.0, TOLD_FIELD,
                          {"true_met": TRUE_FIELD, "gun_bias": GUN_BIAS},
                          observation_noise_m=15.0, noise_seed=1)
-    adj0 = res["phase_misses"]["ADJUSTMENT"][0]
+    open0 = res["phase_misses"]["REGISTRATION"][0]
     assert res["final_cep"] < 25.0, res["final_cep"]
-    assert res["final_cep"] < 0.25 * adj0
-    assert np.allclose(res["gun_bias_est"], GUN_BIAS, atol=20.0), res["gun_bias_est"]
+    assert res["final_cep"] < 0.25 * open0
+    assert np.allclose(res["total_correction_est"], res["total_correction_true"],
+                       atol=30.0), res["total_correction_est"]
 
 
 def test_layer3_no_discrepancy_needs_no_correction():
@@ -167,9 +169,9 @@ def test_layer3_no_discrepancy_needs_no_correction():
     # aimed shots are already on target and no spurious correction is invented.
     res = run_engagement("WH", R, 0.0, TOLD_FIELD,
                          {"true_met": TOLD_FIELD, "gun_bias": (0.0, 0.0)})
-    assert res["phase_misses"]["ADJUSTMENT"][0] < 1.0
+    assert res["phase_misses"]["REGISTRATION"][0] < 1.0
     assert res["final_cep"] < 1.0
-    assert np.linalg.norm(res["atmo_correction_est"]) < 0.5
+    assert np.linalg.norm(res["total_correction_est"]) < 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -244,11 +246,10 @@ if __name__ == "__main__":
     res = run_engagement("WH", R, 0.0, TOLD_FIELD,
                          {"true_met": TRUE_FIELD, "gun_bias": GUN_BIAS})
     print(f"    told target wind is a guess; the TRUE target wind is different and never measured.")
-    print(f"    opening aimed miss = {res['phase_misses']['ADJUSTMENT'][0]:.0f} m  ->  "
+    print(f"    opening registration miss = {res['phase_misses']['REGISTRATION'][0]:.0f} m  ->  "
           f"FFE CEP = {res['final_cep']:.1f} m   (the shell sensed it)")
-    print(f"    learned gun bias = {np.round(res['gun_bias_est'], 1)}  (true {GUN_BIAS})")
-    print(f"    learned effective downrange wind correction = "
-          f"{np.round(res['atmo_correction_est'], 2)} m/s")
+    print(f"    learned TOTAL correction = {np.round(res['total_correction_est'], 1)} m  "
+          f"(true {np.round(res['total_correction_true'], 1)} m)")
 
     print("\nWeather along the path (real data; confidence DECREASES toward target):")
     for p in weather_profile_along_path(HorizontalMetField(CALM, TAIL, R, confidence_floor=0.2), n_points=6):

@@ -1,20 +1,28 @@
 """
 Component 6 — Full engagement loop + persistence.
 
-Wires the proven Phase 2 pieces into one complete fire mission:
-  * physics core (Components 1-4.5): the frozen integrate_trajectory, called
-    with met= and use_g7=True for every shot;
-  * the two SEPARATE estimators (Component 5): GunBiasEstimator (Estimator A)
-    and AtmosphericStateEstimator (Estimator B), used unchanged;
-  * the three-phase doctrine (register -> adjust -> fire for effect);
-  * the Phase 1 engagement database (weapon_profiles / engagements / rounds),
-    extended with a few added columns for the Phase 2 gun bias + atmospheric
-    correction (columns added via ALTER TABLE; the schema is never rewritten).
+REDESIGN (shot-correction). The old loop treated the first two shots as
+registration and ran a forgetting-RLS estimator trying to recover FOUR parameters
+(gun bias dr/cr, wind error dr/cr) from fall of shot. That split is
+mathematically under-determined from a single impact (which is why the wind term
+stayed stuck at 0.0 and shot 2 sometimes regressed). It is replaced by a
+two-shot-kill doctrine:
 
-This is INTEGRATION, not new physics. Nothing in the frozen physics files or
-the validated estimators is modified — they are called as tools. The hidden
-true conditions (real wind error + real gun bias) drive the fall of shot; the
-system only ever sees the miss. numpy + stdlib + sqlite3 only.
+  * physics core (Components 1-4.5): the frozen integrate_trajectory, called with
+    met= and use_g7=True for every shot — called as a tool, never modified;
+  * Shot 1 = REGISTRATION: fire the nominal told-MET solution, observe the FULL
+    miss. That miss is the total impact-space offset (gun bias + met error,
+    combined and unrecoverable apart from a single impact);
+  * Shot 2 = FIRE FOR EFFECT: a one-step Newton aim correction inverts the
+    impact-vs-aim map and lands inside the lethal radius (met is stable over the
+    engagement, so the offset recurs);
+  * Shot 3+ : a forgetting-RLS refiner (_OffsetRefiner), seeded to agree with the
+    shot-2 Newton step, only sharpens the total offset from accumulated impacts;
+  * the Phase 1 engagement database (weapon_profiles / engagements / rounds),
+    extended via ALTER TABLE for the learned correction (schema never rewritten).
+
+The system only ever sees the miss; the hidden true conditions drive the fall of
+shot. numpy + stdlib + sqlite3 only.
 """
 
 import numpy as np
@@ -22,8 +30,8 @@ import numpy as np
 from physics.trajectory import integrate_trajectory
 from physics.met_message import MetMessage
 from physics.horizontal_met import HorizontalMetField
-from physics.state_estimator import (GunBiasEstimator, AtmosphericStateEstimator,
-                                     wind_sensitivity)
+# _ScalarRLS (the proven scalar forgetting-RLS) backs the shot-3+ offset refiner.
+from physics.state_estimator import _ScalarRLS
 
 V0 = 827.0  # standard 155mm muzzle velocity (charge)
 
@@ -94,26 +102,154 @@ def _impact_rc(met, elevation_deg, bearing_deg):
     return _world_to_rc(np.array([r["impact_x"], r["impact_y"]]), bearing_deg)
 
 
-def _solve_elevation(met, target_range, bearing_deg, lo=15.0, hi=48.0):
-    """Fire-control solution: elevation (ascending branch) whose downrange under
-    `met` equals target_range. Simple bisection on the monotonic branch."""
+def _solve_elevation(met, target_range, bearing_deg, target_height_m=0.0,
+                     dt=0.01, lo=15.0, hi=48.0):
+    """Coarse fire-control elevation (ascending branch) whose downrange under
+    `met` ~ target_range, by bisection. Only a SEED for _solve_aim's Newton
+    refinement, so a metre-level tolerance and few iterations are plenty.
+    Height-aware (target_height_m=0.0 reproduces the former ground-impact solve)."""
     def dr(e):
-        return _impact_rc(met, e, bearing_deg)[0] - target_range
-    flo, fhi = dr(lo), dr(hi)
-    if flo > 0:  # target shorter than even the minimum elevation reaches
+        p = _aim_impact_rc(met, e, bearing_deg, bearing_deg, target_height_m, dt)
+        return -1e9 if p is None else p[0] - target_range  # unreachable -> too short
+    if dr(lo) > 0:  # target shorter than even the minimum elevation reaches
         return lo
-    if fhi < 0:  # target beyond max range at hi; clamp
+    if dr(hi) < 0:  # target beyond max range at hi; clamp
         return hi
-    for _ in range(60):
+    for _ in range(22):
         mid = 0.5 * (lo + hi)
         fm = dr(mid)
-        if abs(fm) < 1e-3:
+        if abs(fm) < 5.0:               # ~5 m is ample for a Newton seed
             return mid
         if fm > 0:
             hi = mid
         else:
             lo = mid
     return 0.5 * (lo + hi)
+
+
+# ===========================================================================
+# Newton aim-correction core (REDESIGN — replaces the under-determined
+# 4-parameter forgetting-RLS that tried to split gun bias from wind error on
+# early shots). The fall of shot disagrees with the told-MET fire-control
+# prediction by a near-CONSTANT impact-space offset: the gun's static mechanical
+# bias PLUS the (stable over the ~2 h engagement window) met error, combined.
+# We do NOT try to decompose that offset from a single impact — it is provably
+# unrecoverable from one shot. Instead we cancel the TOTAL offset by correcting
+# the AIM (elevation, azimuth) with a Newton step on the trajectory map.
+# ===========================================================================
+def _aim_impact_rc(met, elev, az, bearing, target_height_m=0.0, dt=0.01):
+    """Told-model impact of one shot in the range/cross frame, height-aware.
+    Returns None if the target altitude is unreachable at this elevation."""
+    r = integrate_trajectory(v0=V0, elevation_deg=elev, azimuth_deg=az,
+                             met=met, use_g7=True, target_height_m=target_height_m,
+                             dt=dt)
+    if r.get("reached") is False:
+        return None
+    return _world_to_rc(np.array([r["impact_x"], r["impact_y"]]), bearing)
+
+
+def _aim_jacobian(met, elev, az, bearing, target_height_m=0.0, dt=0.01,
+                  d_elev=0.05, d_az=0.05, base=None):
+    """2x2 finite-difference Jacobian J = d(impact_dr, impact_cr)/d(elev, az)
+    (metres per degree), measured from the frozen integrator — there is no
+    analytic form. Columns: [d/d_elev, d/d_az]. This is the same empirical-
+    sensitivity technique already used for wind (wind_sensitivity), applied to the
+    aim instead. `base` (impact at the un-perturbed aim) is reused if supplied to
+    save one integration."""
+    if base is None:
+        base = _aim_impact_rc(met, elev, az, bearing, target_height_m, dt)
+    j_e = (_aim_impact_rc(met, elev + d_elev, az, bearing, target_height_m, dt) - base) / d_elev
+    j_a = (_aim_impact_rc(met, elev, az + d_az, bearing, target_height_m, dt) - base) / d_az
+    return np.column_stack([j_e, j_a])
+
+
+def _solve_aim(met, goal_rc, bearing, elev0, az0, target_height_m=0.0, dt=0.01,
+               iters=6, tol=0.5):
+    """Find the aim (elevation, azimuth) whose TOLD-MODEL impact equals goal_rc
+    (no real rounds fired).
+
+    THE NEWTON STEP.  With J the aim->impact Jacobian and err = impact-goal, one
+    step is  aim <- aim - J^-1 err.  A SINGLE step leaves a large residual when the
+    correction is big (the elevation->range map curves), so we ITERATE on the
+    fully-available told model until the model impact sits on goal_rc — this costs
+    no real shots and removes the curvature error a one-step Newton leaves. The
+    Jacobian is measured ONCE (the map is close to linear over the correction, so a
+    fixed-J chord iteration converges) which keeps the integration count low.
+    np.linalg.pinv (not inv) makes a near-singular J degrade gracefully instead of
+    throwing — J loses rank near maximum range, where d range / d elev -> 0."""
+    elev, az = float(elev0), float(az0)
+    cur = _aim_impact_rc(met, elev, az, bearing, target_height_m, dt)
+    if cur is None:                      # back the elevation off until reachable
+        for _ in range(20):
+            elev = max(1.0, elev - 1.0)
+            cur = _aim_impact_rc(met, elev, az, bearing, target_height_m, dt)
+            if cur is not None:
+                break
+    Jinv = np.linalg.pinv(_aim_jacobian(met, elev, az, bearing, target_height_m,
+                                        dt, base=cur))
+    for _ in range(iters):
+        err = cur - goal_rc
+        if np.hypot(*err) < tol:
+            break
+        step = np.clip(Jinv @ err, -5.0, 5.0)   # fixed-J (chord) Newton step
+        elev = float(np.clip(elev - step[0], 1.0, 89.0))
+        az = float(az - step[1])
+        cur = _aim_impact_rc(met, elev, az, bearing, target_height_m, dt)
+        if cur is None:                  # stepped past the apex: undo and stop
+            elev = float(np.clip(elev + step[0], 1.0, 89.0))
+            az = float(az + step[1])
+            break
+    return elev, az
+
+
+def true_total_offset(target_range, target_bearing, told_met, true_met, gun_bias,
+                      target_height_m=0.0, dt=0.02):
+    """The true total impact-space offset (gun bias + met error, combined) at the
+    nominal told-MET aim — i.e. realised fall of shot minus target. This is what a
+    PRIOR mission on the same weapon under the same (stable) met would have
+    learned, so it is the correct quantity to warm-start a remembered weapon with.
+    Used by the sim's warm-start toggle; the live loop learns it from fall of shot."""
+    target = np.array([float(target_range), 0.0])
+    elev0 = _solve_elevation(told_met, target_range, target_bearing,
+                             target_height_m, dt=dt)
+    elev, az = _solve_aim(told_met, target, target_bearing, elev0,
+                          target_bearing, target_height_m, dt=dt)
+    gb = np.asarray(gun_bias, dtype=float)
+    return (_aim_impact_rc(true_met, elev, az, target_bearing, target_height_m, dt)
+            + gb - target)
+
+
+class _OffsetRefiner:
+    """Two-axis forgetting-RLS estimate of the CONSTANT impact-space offset
+    (downrange, cross) between the realised fall of shot and the told-MET model
+    — gun bias + met error COMBINED, deliberately not decomposed.
+
+    Demoted from the primary corrector to a shot-3+ refiner. The first observed
+    offset SEEDS it exactly, so its correction on shot 2 equals the full shot-1
+    miss (it agrees with the one-step Newton solve); thereafter it only SHARPENS
+    the estimate from accumulated impacts. lam is near 1.0 because the offset is
+    static over the engagement — aggressive forgetting causes covariance windup;
+    R damps a single lucky/unlucky impact so it can't whip the aim."""
+
+    def __init__(self, lam=0.99, R=400.0, init_P=1.0e4):
+        self._dr = _ScalarRLS(0.0, init_P=init_P, lam=lam, R=R)
+        self._cr = _ScalarRLS(0.0, init_P=init_P, lam=lam, R=R)
+        self.seeded = False
+
+    def seed(self, offset):
+        """Set the estimate to the first observed offset with a tightened
+        covariance, so shot 2's Newton correction equals the full shot-1 miss."""
+        self._dr.x, self._cr.x = float(offset[0]), float(offset[1])
+        self._dr.P = self._dr.R
+        self._cr.P = self._cr.R
+        self.seeded = True
+
+    def update(self, offset):
+        self._dr.update(float(offset[0]))
+        self._cr.update(float(offset[1]))
+
+    def state(self):
+        return np.array([self._dr.get(), self._cr.get()])
 
 
 # ===========================================================================
@@ -221,172 +357,169 @@ def _save_gun_bias(db, weapon_id, weapon_type, gun_bias, n_eng, total_rounds):
 
 
 # ===========================================================================
-# The engagement loop.
+# The engagement loop (REDESIGN — one-step Newton, not 4-parameter RLS).
 # ===========================================================================
 def run_engagement(weapon_id, target_range, target_bearing,
                    met_message, true_conditions, db=None,
                    n_register=2, n_adjust=4, n_ffe=4,
                    weapon_type="155mm-M107", converge_threshold_m=40.0,
-                   observation_noise_m=0.0, noise_seed=None):
+                   observation_noise_m=0.0, noise_seed=None,
+                   alpha=1.0, offset_refine_lambda=0.99, dt=0.02):
     """
     Runs a complete Phase 2 fire mission against a target.
 
-    true_conditions: dict carrying the HIDDEN truth the system is not told:
-        {"true_met": MetMessage,            # the real atmosphere (weather)
-         "gun_bias": (dr_m, cr_m)}          # the gun's real constant offset
-      The real fall of shot = integrate(true_met) + gun_bias. The told
-      `met_message` is the imperfect MET the fire-control computer uses.
+    DOCTRINE (redesigned — shoot-and-scoot: minimise rounds, then displace):
+      * Shot 1  = REGISTRATION: fire the nominal told-MET fire-control solution
+        and observe the FULL miss vector (dr, cr). That miss IS the total impact-
+        space offset (gun bias + met error, combined). We do NOT try to split it
+        into gun vs wind from one impact — that decomposition is unrecoverable.
+      * Shot 2+ = FIRE FOR EFFECT: the aim is re-solved so the told model lands on
+        (target - offset) — the one-step Newton correction inverting the impact-
+        vs-aim map. Met is stable over the ~2 h engagement, so the offset recurs
+        and shot 2 lands on target.
+      * Shot 3+ : a forgetting-RLS refiner (seeded to agree with the shot-2 Newton
+        step) only SHARPENS the offset from accumulated impacts.
 
-    observation_noise_m: std dev (m, per axis) of the measurement error in the
-      REPORTED fall of shot (Component 13). Nobody measures the impact with a
-      ruler: a forward observer / drone / radar estimates the miss with error.
-      The true physics is untouched — the shell really lands where the frozen
-      integrator says — but the miss the ESTIMATORS learn from is the true miss
-      plus N(0, observation_noise_m) per axis, and the Kalman/RLS measurement-
-      noise term is raised to match. Default 0.0 reproduces perfect observation
-      bit-for-bit. ~10-20 m is realistic for a competent optical/laser observer
-      at multi-km range; a precise drone/radar is smaller, a degraded visual
-      observer larger. noise_seed makes the realization reproducible.
+    true_conditions: the HIDDEN truth the system is not told:
+        {"true_met": MetMessage, "gun_bias": (dr_m, cr_m)}.
+      Real fall of shot = integrate(true_met) + gun_bias; the told `met_message`
+      is the imperfect MET the fire-control computer uses.
 
-    Doctrine:
-      1. REGISTRATION — fire under a known-good MET (== true_met) so every miss
-         isolates the gun's mechanical bias -> GunBiasEstimator (A). A remembered
-         bias from the DB warm-starts this phase.
-      2. ADJUSTMENT  — fire under the imperfect told MET; remove the known gun
-         bias; the residual miss is atmospheric -> AtmosphericStateEstimator (B).
-      3. FIRE FOR EFFECT — lock both corrections, fire the mission rounds.
-      4. PERSIST     — write the learned gun bias + engagement record to the DB.
+    n_register/n_adjust/n_ffe: kept for backward compatibility. The redesign
+      always fires exactly ONE registration shot; (n_adjust + n_ffe) effect rounds
+      follow, early-stopped once the miss is within converge_threshold_m (unless
+      the threshold is 0). final_cep is the median of the last n_ffe effect misses.
+
+    alpha: Newton damping in [0, 1] (default 1.0); alpha slightly < 1 guards
+      against Jacobian error / overshoot.
+    offset_refine_lambda: forgetting factor of the shot-3+ refiner (~1.0; the
+      offset is static, so aggressive forgetting only causes covariance windup).
+    observation_noise_m / noise_seed: Component 13 — the estimator learns from the
+      noisy REPORTED fall of shot; the true physics is untouched. 0.0 reproduces
+      perfect observation bit-for-bit.
     """
     true_met = true_conditions["true_met"]
     true_gun = np.asarray(true_conditions["gun_bias"], dtype=float)
+    told_met = met_message
 
-    # --- Observation noise (Component 13): a seedable measurement error on the
-    # REPORTED fall of shot. Applied only where the miss is handed to an
-    # estimator, never to the true physics. obs_var feeds the filters' R term.
     obs_noise = float(observation_noise_m)
     if obs_noise < 0.0:
         raise ValueError("observation_noise_m must be >= 0")
     obs_var = obs_noise ** 2
     _rng = np.random.default_rng(noise_seed) if obs_noise > 0.0 else None
 
-    def observe(true_miss):
-        """The fall of shot the estimators LEARN from: the true miss as reported
-        by a noisy sensor. With observation_noise_m=0 this is the true miss
-        unchanged (bit-for-bit); otherwise true_miss + N(0, obs_noise) per axis."""
-        if _rng is None:
-            return true_miss
-        return true_miss + _rng.normal(0.0, obs_noise, size=2)
+    def observe(true_vec):
+        """Noisy sensor report of a true 2-vector (m). noise=0 -> unchanged."""
+        v = np.asarray(true_vec, dtype=float)
+        return v if _rng is None else v + _rng.normal(0.0, obs_noise, size=2)
 
-    # Fire-control elevation from the TOLD MET (the nominal solution).
-    elevation = _solve_elevation(met_message, target_range, target_bearing)
+    def told_impact(elev, az):
+        return _aim_impact_rc(told_met, elev, az, target_bearing, dt=dt)
 
-    # Wind sensitivity H (m per m/s), measured from the frozen integrator by
-    # perturbing the told MET by +1 m/s uniform in each horizontal axis.
-    base_imp = _impact_rc(met_message, elevation, target_bearing)
-    h_dr = _impact_rc(_met_plus_uniform_wind(met_message, _rc_to_world([1.0, 0.0], target_bearing)),
-                      elevation, target_bearing) - base_imp
-    h_cr = _impact_rc(_met_plus_uniform_wind(met_message, _rc_to_world([0.0, 1.0], target_bearing)),
-                      elevation, target_bearing) - base_imp
-    H = np.column_stack([h_dr, h_cr])
+    def realized(elev, az):
+        """Hidden TRUE fall of shot in the range/cross frame."""
+        return _aim_impact_rc(true_met, elev, az, target_bearing, dt=dt) + true_gun
 
-    # --- Estimators (Component 5, unchanged). Warm-start A from the DB. ---
+    target = np.array([float(target_range), 0.0])
+
+    # Nominal fire-control aim: told model lands on the target in BOTH axes.
+    elev0 = _solve_elevation(told_met, target_range, target_bearing, dt=dt)
+    elev_nom, az_nom = _solve_aim(told_met, target, target_bearing, elev0,
+                                  target_bearing, dt=dt)
+
+    # The demoted RLS refiner; R reflects the model floor plus observation noise.
+    refiner = _OffsetRefiner(lam=offset_refine_lambda, R=400.0 + obs_var)
+
+    # Warm start: a remembered weapon seeds the offset so shot 1 is pre-corrected.
     warm = None
     if db is not None:
         _ensure_phase2_columns(db)
-        warm = _load_gun_bias(db, weapon_id)
+        warm = _load_gun_bias(db, weapon_id)   # legacy column name; holds TOTAL offset
     warm_started = warm is not None
-    # The measurement-noise term is the filters' assumed model floor PLUS the
-    # observation noise (the correct place to tell a Kalman filter how noisy its
-    # measurements are). obs_var=0 leaves the established R values untouched.
-    estA = GunBiasEstimator(init=tuple(warm) if warm_started else (0.0, 0.0),
-                            init_P=(100.0 if warm_started else 1.0e4),
-                            R=400.0 + obs_var)
-    estB = AtmosphericStateEstimator([0.0, 0.0], np.diag([25.0, 25.0]),
-                                     np.diag([0.05, 0.05]),
-                                     np.diag([2500.0 + obs_var, 2500.0 + obs_var]))
+    if warm_started:
+        refiner.seed(warm)
 
-    history = []          # list of (phase, miss_vector)
+    history = []
     round_no = 0
-    rounds_to_converge = None
+    rounds_to_converge = [None]   # boxed so the closure can set it
 
-    def observed_rc():
-        return _impact_rc(true_met, elevation, target_bearing) + true_gun
-
-    def log_miss(phase, miss):
+    def fire(phase):
+        """Fire one round at the current offset estimate, log it, learn from the
+        noisy report, and track first convergence. Returns the true radial."""
         nonlocal round_no
-        round_no += 1
+        if phase == "REGISTRATION" and not warm_started:
+            elev, az = elev_nom, az_nom            # cold opener: pure nominal aim
+        else:
+            goal = target - alpha * refiner.state()
+            elev, az = _solve_aim(told_met, goal, target_bearing, elev_nom,
+                                  az_nom, dt=dt)
+        true_rc = realized(elev, az)               # one integration, reused below
+        miss = true_rc - target
         radial = float(np.hypot(*miss))
+        round_no += 1
         history.append({"phase": phase, "round": round_no,
                         "miss": miss.copy(), "radial": radial})
+        offset_obs = observe(true_rc) - told_impact(elev, az)
+        if refiner.seeded:
+            refiner.update(offset_obs)
+        else:
+            refiner.seed(offset_obs)
+        if (rounds_to_converge[0] is None and converge_threshold_m > 0.0
+                and radial < converge_threshold_m):
+            rounds_to_converge[0] = round_no
+        return radial
 
-    # --- Phase 1: REGISTRATION (known-good MET == true_met; isolate gun) -----
-    # Known-good MET means predicted and observed share the same atmosphere, so
-    # the residual miss is PURE gun bias. Predicted includes the current gun
-    # estimate, so the registration miss shrinks as A learns (and is small from
-    # the first shot when warm-started). The estimator observes the ABSOLUTE
-    # gun offset = miss + current estimate.
-    for _ in range(n_register):
-        predicted = _impact_rc(true_met, elevation, target_bearing) + estA.state()
-        miss = observed_rc() - predicted               # = true_gun - estA (true)
-        log_miss("REGISTRATION", miss)
-        # The estimator learns from the NOISY reported miss; the true fall of
-        # shot (logged above) is what really happened.
-        estA.update(observe(miss) + estA.state())      # absolute gun observation
-        if float(np.hypot(*miss)) < converge_threshold_m and round_no >= 1:
-            break
-    round_after_reg = round_no
+    # --- Shot 1: REGISTRATION (warm: already pre-corrected) -------------------
+    fire("REGISTRATION")
 
-    # --- Phase 2: ADJUSTMENT (imperfect MET; remove gun; isolate wind) -------
-    for _ in range(n_adjust):
-        corrected_met = _met_plus_uniform_wind(
-            met_message, _rc_to_world(estB.state(), target_bearing))
-        predicted = _impact_rc(corrected_met, elevation, target_bearing) + estA.state()
-        miss = observed_rc() - predicted
-        log_miss("ADJUSTMENT", miss)
-        estB.predict()
-        estB.update(observe(miss), H)                  # learn from noisy report
-        if float(np.hypot(*miss)) < 0.5 * converge_threshold_m and round_no >= round_after_reg + 1:
-            break
-
-    # Rounds-to-converge = the register+adjust rounds spent dialling in before
-    # FFE. Warm-starting the gun bias from the DB cuts the registration rounds,
-    # so a remembered weapon converges in fewer rounds.
-    rounds_to_converge = round_no
-
-    # --- Phase 3: FIRE FOR EFFECT (lock both corrections) -------------------
-    corrected_met = _met_plus_uniform_wind(
-        met_message, _rc_to_world(estB.state(), target_bearing))
+    # --- Shots 2+: FIRE FOR EFFECT (Newton correction + refiner) -------------
+    n_effect = max(1, int(n_adjust) + int(n_ffe))
     ffe_radials = []
-    for _ in range(n_ffe):
-        predicted = _impact_rc(corrected_met, elevation, target_bearing) + estA.state()
-        miss = observed_rc() - predicted
-        log_miss("FFE", miss)
-        ffe_radials.append(float(np.hypot(*miss)))
+    for _ in range(n_effect):
+        ffe_radials.append(fire("FFE"))
+        # Once converged, fire just enough effect rounds to form a CEP group.
+        if (converge_threshold_m > 0.0 and ffe_radials[-1] < converge_threshold_m
+                and len(ffe_radials) >= max(1, int(n_ffe))):
+            break
+    if rounds_to_converge[0] is None:
+        rounds_to_converge[0] = round_no
 
-    final_cep = float(np.median(ffe_radials)) if ffe_radials else None
+    grp = ffe_radials[-max(1, int(n_ffe)):] if ffe_radials else []
+    final_cep = float(np.median(grp)) if grp else None
+
+    # The honest learned quantity is the TOTAL correction; we do not split it into
+    # gun bias vs wind error from these impacts (provably unrecoverable per shot).
+    total_correction = refiner.state()
+    # The true total offset (for the learned-vs-truth panel): the realised fall of
+    # shot at the nominal aim minus the target — i.e. the full error to be cancelled.
+    total_correction_true = realized(elev_nom, az_nom) - target
 
     result = {
         "weapon_id": weapon_id,
         "target_range": target_range,
         "target_bearing": target_bearing,
-        "elevation_deg": elevation,
+        "elevation_deg": elev_nom,
         "warm_started": warm_started,
         "history": history,
         "phase_misses": {p: [h["radial"] for h in history if h["phase"] == p]
                          for p in ("REGISTRATION", "ADJUSTMENT", "FFE")},
         "final_cep": final_cep,
-        "gun_bias_est": estA.state(),
-        "atmo_correction_est": estB.state(),
-        "rounds_to_converge": rounds_to_converge,
+        "total_correction_est": total_correction,
+        "total_correction_true": total_correction_true,
+        # Back-compat keys: gun_bias_est now carries the TOTAL offset; the gun/wind
+        # split is no longer claimed, so atmo_correction_est is reported as zero.
+        "gun_bias_est": total_correction,
+        "atmo_correction_est": np.array([0.0, 0.0]),
+        "rounds_to_converge": rounds_to_converge[0],
         "total_shots": round_no,
     }
 
-    # --- Phase 4: PERSIST ---------------------------------------------------
+    # --- PERSIST ------------------------------------------------------------
     if db is not None:
         prof = db.get_weapon_profile(weapon_id)
         n_eng = (prof["n_engagements"] if prof else 0) + 1
         total_rounds = (prof["total_rounds_fired"] if prof else 0) + round_no
-        _save_gun_bias(db, weapon_id, weapon_type, estA.state(), n_eng, total_rounds)
+        _save_gun_bias(db, weapon_id, weapon_type, total_correction, n_eng, total_rounds)
 
         reg0 = result["phase_misses"]["REGISTRATION"][0] if result["phase_misses"]["REGISTRATION"] else None
         eid = db.record_engagement(
@@ -394,17 +527,17 @@ def run_engagement(weapon_id, target_range, target_bearing,
             target_bearing=target_bearing, target_height=0.0,
             uncorrected_cep=reg0, corrected_cep=final_cep,
             improvement_pct=(100.0 * (1 - final_cep / reg0) if reg0 and final_cep is not None else None),
-            rounds_to_converge=rounds_to_converge, total_shots=round_no,
+            rounds_to_converge=rounds_to_converge[0], total_shots=round_no,
             warm_started=1 if warm_started else 0,
             delta_pitch=None, delta_yaw=None, delta_v0=None)
         db._conn.execute(
             "UPDATE engagements SET atmo_dwind_dr=?, atmo_dwind_cr=?, final_cep=? "
             "WHERE engagement_id=?",
-            (float(estB.state()[0]), float(estB.state()[1]),
+            (float(total_correction[0]), float(total_correction[1]),
              final_cep, int(eid)))
         db._conn.commit()
         for h in history:
-            db.record_round(eid, h["round"], h["phase"], elevation,
+            db.record_round(eid, h["round"], h["phase"], elev_nom,
                             target_bearing, V0, None, h["radial"], None, None, None)
         result["engagement_id"] = eid
 
@@ -413,44 +546,37 @@ def run_engagement(weapon_id, target_range, target_bearing,
 
 # ===========================================================================
 # Component 9 — fire until destroyed, then stop (adaptable lethal radius).
-# A NEW function; run_engagement above is untouched. It reuses the same proven
-# estimators and frozen integrator as tools.
+# Two-shot-kill doctrine: shot 1 registers, shot 2 fires for effect and lands
+# inside the lethal radius; the mission stops the instant a round is lethal.
+# Reuses the shared Newton aim core and the frozen integrator as tools.
 # ===========================================================================
 def run_engagement_until_destroyed(weapon_id, target_range, target_bearing,
                                    met_message, true_conditions, db=None,
                                    lethal_radius_m=8.0, max_rounds=15,
-                                   min_learning_rounds=2,
+                                   min_learning_rounds=1,
                                    weapon_type="155mm-M107",
                                    target_height_m=0.0,
-                                   observation_noise_m=0.0, noise_seed=None):
+                                   observation_noise_m=0.0, noise_seed=None,
+                                   alpha=1.0, offset_refine_lambda=0.99, dt=0.02):
     """
     Fires, learns from each miss, and STOPS the instant a round lands within
-    lethal_radius_m of the target (target destroyed) — or when max_rounds is
-    reached (safety cap). Returns the shot-by-shot trace, whether the target
-    was destroyed, the round number that destroyed it, and the final miss.
+    lethal_radius_m of the target — modelling shoot-and-scoot (minimise rounds,
+    then displace). Shot 1 registers (full miss observed); shot 2 is the Newton
+    kill shot; shots 3+ (only if shot 2 missed lethal) are refiner rounds.
 
-    lethal_radius_m: distance within which a round destroys the target.
-      Adaptable — any positive value; default 8.0 (155mm standard). A precision
-      use case might set 2 m, an area weapon 30 m; the model fits the case.
+    lethal_radius_m: kill distance (adaptable; default 8.0 for 155 mm).
     max_rounds: safety cap so the mission can't fire forever.
-    min_learning_rounds: fire at least this many ranging/adjustment rounds
-      before it's allowed to declare a hit (the first cold shot at long range
-      rarely lands within lethal radius; the system needs a couple of
-      observations to learn the gun bias and atmospheric error).
+    min_learning_rounds: a round may be declared a kill only from this round on
+      (default 1; the first cold registration shot rarely lands lethal anyway).
     target_height_m: passed through to the integrator (Component 8).
-    observation_noise_m: std dev (m, per axis) of measurement error on the
-      REPORTED fall of shot (Component 13). The estimators learn from the noisy
-      report; the KILL assessment uses the TRUE fall of shot (a round physically
-      within lethal_radius is effect-achieved — a BDA system would confirm it,
-      see DATA_SOURCES_AND_SCOPE.md). 0.0 reproduces perfect observation
-      bit-for-bit. noise_seed makes the realization reproducible.
+    alpha: Newton damping (default 1.0). offset_refine_lambda: refiner forgetting.
+    observation_noise_m / noise_seed: Component 13 — estimator learns from the
+      noisy REPORTED miss; the KILL assessment uses the TRUE fall of shot. 0.0
+      reproduces perfect observation bit-for-bit.
 
-    Doctrine: a remembered weapon (gun bias in the DB) skips registration and
-    fires for effect immediately; an unknown weapon fires a brief registration
-    (known-good MET) to learn — and persist — its mechanical bias first. Either
-    way the operation rounds aim at the target under the imperfect told MET, the
-    atmospheric Kalman learns the residual from each miss, and the mission ends
-    the instant a round falls within the lethal radius.
+    A remembered weapon (DB) seeds the total offset so shot 1 is pre-corrected and
+    can be lethal on the first round; an unknown weapon fires one registration
+    shot first. Either way the loop ends the instant a round falls within lethal.
     """
     if lethal_radius_m <= 0.0:
         raise ValueError("lethal_radius_m must be positive")
@@ -459,27 +585,18 @@ def run_engagement_until_destroyed(weapon_id, target_range, target_bearing,
     true_gun = np.asarray(true_conditions["gun_bias"], dtype=float)
     told_met = met_message
 
-    # Observation noise (Component 13) — applied only to the miss the estimators
-    # learn from, never to the true physics or the kill assessment.
     obs_noise = float(observation_noise_m)
     if obs_noise < 0.0:
         raise ValueError("observation_noise_m must be >= 0")
     obs_var = obs_noise ** 2
     _rng = np.random.default_rng(noise_seed) if obs_noise > 0.0 else None
 
-    def observe(true_miss):
-        """Noisy sensor report of the true miss for the estimators. With
-        observation_noise_m=0 returns the true miss unchanged (bit-for-bit)."""
-        if _rng is None:
-            return true_miss
-        return true_miss + _rng.normal(0.0, obs_noise, size=2)
+    def observe(true_vec):
+        v = np.asarray(true_vec, dtype=float)
+        return v if _rng is None else v + _rng.normal(0.0, obs_noise, size=2)
 
-    # --- Honest reachability guard (Option A) -------------------------------
-    # Before firing a single round, check the target is actually within the
-    # projectile's maximum range (computed from its real parameters, NOT
-    # hardcoded). If not, refuse: return reachable=False with zero rounds and no
-    # claim of destruction. Computed once per mission. A reachable target is
-    # completely unaffected and proceeds exactly as before.
+    # --- Honest reachability guard (Option A): refuse an impossible target
+    # instead of fabricating a "destroyed" result. ---------------------------
     max_range_m = max_achievable_range({"v0": V0}, met=told_met,
                                        target_height_m=target_height_m)
     if target_range > max_range_m:
@@ -500,62 +617,31 @@ def run_engagement_until_destroyed(weapon_id, target_range, target_bearing,
             "history": [],
         }
 
-    # Height-aware impact in the range/cross frame (None if unreachable).
-    def imp(met, elev):
-        r = integrate_trajectory(v0=V0, elevation_deg=elev,
-                                 azimuth_deg=target_bearing, met=met,
-                                 use_g7=True, target_height_m=target_height_m)
-        if r.get("reached") is False:
-            return None
-        return _world_to_rc(np.array([r["impact_x"], r["impact_y"]]), target_bearing)
+    target = np.array([float(target_range), 0.0])
 
-    # Fire-control elevation (height-aware) putting the told-MET impact on target.
-    def solve_elev(lo=15.0, hi=48.0):
-        def dr(e):
-            p = imp(told_met, e)
-            return -1e9 if p is None else p[0] - target_range
-        if dr(lo) > 0:
-            return lo
-        if dr(hi) < 0:
-            return hi
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            fm = dr(mid)
-            if abs(fm) < 1e-3:
-                return mid
-            if fm > 0:
-                hi = mid
-            else:
-                lo = mid
-        return 0.5 * (lo + hi)
+    def told_impact(elev, az):
+        return _aim_impact_rc(told_met, elev, az, target_bearing, target_height_m, dt)
 
-    elevation = solve_elev()
+    def realized(elev, az):
+        ti = _aim_impact_rc(true_met, elev, az, target_bearing, target_height_m, dt)
+        return None if ti is None else ti + true_gun
 
-    # Wind sensitivity H (metres per m/s) at the told MET, height-aware.
-    base = imp(told_met, elevation)
-    h_dr = imp(_met_plus_uniform_wind(told_met, _rc_to_world([1.0, 0.0], target_bearing)),
-               elevation) - base
-    h_cr = imp(_met_plus_uniform_wind(told_met, _rc_to_world([0.0, 1.0], target_bearing)),
-               elevation) - base
-    H = np.column_stack([h_dr, h_cr])
+    elev0 = _solve_elevation(told_met, target_range, target_bearing,
+                             target_height_m, dt=dt)
+    elev_nom, az_nom = _solve_aim(told_met, target, target_bearing,
+                                  elev0, target_bearing, target_height_m, dt=dt)
 
-    # Warm-start the gun bias (Estimator A) from the DB if the weapon is known.
+    refiner = _OffsetRefiner(lam=offset_refine_lambda, R=400.0 + obs_var)
+
     warm = None
     if db is not None:
         _ensure_phase2_columns(db)
-        warm = _load_gun_bias(db, weapon_id)
+        warm = _load_gun_bias(db, weapon_id)   # legacy column name; holds TOTAL offset
     warm_started = warm is not None
-    # Raise the filters' measurement-noise term to reflect the observation noise
-    # (obs_var=0 leaves the established R values untouched -> bit-for-bit).
-    estA = GunBiasEstimator(init=tuple(warm) if warm_started else (0.0, 0.0),
-                            init_P=(100.0 if warm_started else 1.0e4),
-                            R=400.0 + obs_var)
-    estB = AtmosphericStateEstimator([0.0, 0.0], np.diag([25.0, 25.0]),
-                                     np.diag([0.05, 0.05]),
-                                     np.diag([2500.0 + obs_var, 2500.0 + obs_var]))
+    if warm_started:
+        refiner.seed(warm)
 
-    obs_true = imp(true_met, elevation)        # constant realized impact (hidden)
-    if obs_true is None:
+    if realized(elev_nom, az_nom) is None:
         raise ValueError("target altitude unreachable under true conditions")
 
     history = []
@@ -564,62 +650,56 @@ def run_engagement_until_destroyed(weapon_id, target_range, target_bearing,
     destroying_round = None
     final_miss = None
 
-    def log(phase, miss, destroy):
-        nonlocal round_no
-        round_no += 1
-        history.append({"round": round_no, "phase": phase,
-                        "miss": [float(miss[0]), float(miss[1])],
-                        "radial": float(np.hypot(*miss)),
-                        "destroyed_target": bool(destroy)})
-        return round_no
-
-    # --- COLD start only: brief registration to learn + persist the gun bias.
-    # Known-good MET isolates the gun, so the miss is purely the residual gun
-    # error. (Calibration under an idealised MET, so these rounds do not declare
-    # a kill; the real assessment is the operation rounds below.)
-    if not warm_started:
-        for _ in range(max(2, min_learning_rounds)):
-            if round_no >= max_rounds:
-                break
-            miss = true_gun - estA.state()
-            log("REGISTRATION", miss, False)
-            estA.update(observe(miss) + estA.state())   # learn from noisy report
-            if float(np.hypot(*miss)) < 10.0:
-                break
-
-    # --- OPERATION: fire at the target under the imperfect told MET, assess,
-    # learn the atmospheric residual, and STOP the instant a round is lethal.
     while round_no < max_rounds and not destroyed:
-        corrected_met = _met_plus_uniform_wind(
-            told_met, _rc_to_world(estB.state(), target_bearing))
-        pred = imp(corrected_met, elevation)
-        # TRUE accuracy miss vs the target (the aim correction cancels out): as
-        # the estimators converge this collapses toward zero. The kill is judged
-        # on this real fall of shot, NOT on the noisy observation.
-        miss = (obs_true + true_gun) - (pred + estA.state())
+        this_round = round_no + 1
+        cold_reg = (this_round == 1 and not warm_started)
+        if cold_reg:
+            elev, az = elev_nom, az_nom                    # cold opener: nominal aim
+            phase = "REGISTRATION"
+        else:
+            goal = target - alpha * refiner.state()        # Newton correction
+            elev, az = _solve_aim(told_met, goal, target_bearing,
+                                  elev_nom, az_nom, target_height_m, dt=dt)
+            phase = "FIRE_FOR_EFFECT"
+        true_rc = realized(elev, az)                        # one integration, reused
+        miss = true_rc - target                            # TRUE fall of shot
         radial = float(np.hypot(*miss))
 
-        this_round = round_no + 1
+        # Kill assessment on the TRUE fall of shot. Stop the instant it's lethal.
         if this_round >= min_learning_rounds and radial <= lethal_radius_m:
-            log("FIRE_FOR_EFFECT", miss, True)        # target destroyed -> stop
+            round_no += 1
+            history.append({"round": round_no, "phase": phase,
+                            "miss": [float(miss[0]), float(miss[1])],
+                            "radial": radial, "destroyed_target": True})
             destroyed = True
-            destroying_round = this_round
+            destroying_round = round_no
             final_miss = radial
             break
 
-        log("ADJUSTMENT", miss, False)
-        estB.predict()
-        estB.update(observe(miss), H)                 # learn from noisy report
+        round_no += 1
+        history.append({"round": round_no, "phase": phase,
+                        "miss": [float(miss[0]), float(miss[1])],
+                        "radial": radial, "destroyed_target": False})
+        # Learn the constant offset from the NOISY reported fall of shot.
+        offset_obs = observe(true_rc) - told_impact(elev, az)
+        if refiner.seeded:
+            refiner.update(offset_obs)
+        else:
+            refiner.seed(offset_obs)
 
     if final_miss is None and history:
         final_miss = history[-1]["radial"]
 
-    # Persist the learned gun bias so the next mission on this weapon warm-starts.
+    total_correction = refiner.state()
+    # True total offset (gun bias + met error) at the nominal aim, for the panel.
+    total_correction_true = realized(elev_nom, az_nom) - target
+
+    # Persist the learned TOTAL offset so the next mission warm-starts.
     if db is not None:
         prof = db.get_weapon_profile(weapon_id)
         n_eng = (prof["n_engagements"] if prof else 0) + 1
         total = (prof["total_rounds_fired"] if prof else 0) + round_no
-        _save_gun_bias(db, weapon_id, weapon_type, estA.state(), n_eng, total)
+        _save_gun_bias(db, weapon_id, weapon_type, total_correction, n_eng, total)
 
     return {
         "weapon_id": weapon_id,
@@ -631,8 +711,12 @@ def run_engagement_until_destroyed(weapon_id, target_range, target_bearing,
         "max_rounds": max_rounds,
         "min_learning_rounds": min_learning_rounds,
         "warm_started": warm_started,
-        "gun_bias_est": estA.state(),
-        "atmo_correction_est": estB.state(),
-        "elevation_deg": elevation,
+        "total_correction_est": total_correction,
+        "total_correction_true": total_correction_true,
+        # Back-compat: gun_bias_est now carries the TOTAL offset (gun + met error);
+        # the gun/wind split is no longer claimed, so atmo_correction_est is zero.
+        "gun_bias_est": total_correction,
+        "atmo_correction_est": np.array([0.0, 0.0]),
+        "elevation_deg": elev_nom,
         "history": history,
     }

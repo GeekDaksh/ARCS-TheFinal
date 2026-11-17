@@ -31,3 +31,4 @@ env/
 .env
 *.key
 config.local.*
+arcs_bundle.tgz

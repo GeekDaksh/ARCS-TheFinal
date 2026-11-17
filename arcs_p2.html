@@ -436,11 +436,12 @@ function drawConvergence(e){
 
 /* ---- 4. Learned vs true ---- */
 function fillLearned(e){
+  // Honest telemetry: the TOTAL correction (gun bias + met error, combined),
+  // valid because met is stable over the engagement. The gun/wind split is not
+  // identifiable from a single impact, so it is no longer shown separately.
   const rows = [
-    ['Gun bias · downrange', e.gun_bias_est[0], e.gun_bias_true[0], 'm'],
-    ['Gun bias · cross',     e.gun_bias_est[1], e.gun_bias_true[1], 'm'],
-    ['Wind error · downrange',e.atmo_correction_est[0], e.wind_true[0], 'm/s'],
-    ['Wind error · cross',    e.atmo_correction_est[1], e.wind_true[1], 'm/s'],
+    ['Total correction · downrange', e.total_correction_est[0], e.total_correction_true[0], 'm'],
+    ['Total correction · cross',     e.total_correction_est[1], e.total_correction_true[1], 'm'],
   ];
   $('lvtBody').innerHTML = rows.map(([k,est,tru,u])=>{
     const d = Math.abs(est-tru);
@@ -506,6 +507,8 @@ function packageToEng(pkg){
     rounds_to_converge: (m.destroying_round!=null ? m.destroying_round : m.rounds_fired),
     total_shots: m.rounds_fired, warm_started: m.warm_started,
     target_range: R, elevation_deg: m.elevation_deg, history,
+    total_correction_est:L.total_correction_est,
+    total_correction_true:L.total_correction_true,
     gun_bias_est:L.gun_bias_est, gun_bias_true:L.gun_bias_true,
     atmo_correction_est:L.atmo_correction_est, wind_true:L.atmo_correction_true
   };
@@ -525,7 +528,7 @@ function clearPanels(){
 function showNoMission(){
   $('phaseBadge').textContent='LIVE — WAITING FOR SIM…';
   $('cepVal').innerHTML='— <small>m</small>';
-  $('cepSub').textContent='no mission run yet — run one in the 3D sim (/p2/sim)';
+  $('cepSub').textContent='no mission run yet — run one in the 3D Simulation tab';
   clearPanels();
 }
 function showLiveUnreachable(pkg){
@@ -556,7 +559,7 @@ function setLive(on){
   $('liveBtn').textContent = on ? '📡 live: ON' : '📡 live from sim';
   $('runBtn').disabled = on; $('rndBtn').disabled = on;
   if(on){
-    $('runHint').textContent = 'Mirroring the latest mission run in the 3D sim (/p2/sim) — refreshes automatically.';
+    $('runHint').textContent = 'Mirroring the latest mission run in the 3D Simulation tab — refreshes automatically.';
     pollLast(); liveTimer = setInterval(pollLast, 1500);
   } else {
     if(liveTimer) clearInterval(liveTimer); liveTimer = null;

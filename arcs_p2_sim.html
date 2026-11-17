@@ -199,14 +199,12 @@
   <div class="stat"><span class="k">Altitude</span><span class="v" id="t-alt">—</span></div>
   <div class="stat"><span class="k">Apex</span><span class="v" id="t-apex">—</span></div>
   <div class="stat"><span class="k">Miss</span><span class="v" id="t-miss">—</span></div>
-  <div class="ttl" style="margin-top:14px">Learned vs Hidden Truth</div>
+  <div class="ttl" style="margin-top:14px">Total correction (learned vs truth)</div>
   <table class="lvt"><tbody>
-    <tr><td>Gun dr</td><td class="est" id="l-gdr">—</td><td class="tru" id="l-gdrt">—</td></tr>
-    <tr><td>Gun cr</td><td class="est" id="l-gcr">—</td><td class="tru" id="l-gcrt">—</td></tr>
-    <tr><td>Wind dr</td><td class="est" id="l-wdr">—</td><td class="tru" id="l-wdrt">—</td></tr>
-    <tr><td>Wind cr</td><td class="est" id="l-wcr">—</td><td class="tru" id="l-wcrt">—</td></tr>
+    <tr><td>Downrange (m)</td><td class="est" id="l-tdr">—</td><td class="tru" id="l-tdrt">—</td></tr>
+    <tr><td>Cross (m)</td><td class="est" id="l-tcr">—</td><td class="tru" id="l-tcrt">—</td></tr>
   </tbody></table>
-  <div class="legend"><span style="color:var(--accent)">estimated</span><span>hidden truth →</span></div>
+  <div class="legend"><span style="color:var(--accent)">learned</span><span>true total error →</span></div>
   <div class="outcome" id="outcome">run a mission</div>
 </div>
 
@@ -220,13 +218,12 @@
     <div class="sumcell"><div class="sk">Opening miss → final</div><div class="sv" id="sm-conv">—</div></div>
     <div class="sumcell"><div class="sk">Tighter by</div><div class="sv" id="sm-factor">—</div></div>
   </div>
-  <div class="ttl" style="margin-top:12px">Learned from fall of shot alone</div>
+  <div class="ttl" style="margin-top:12px">Total correction learned from fall of shot</div>
   <table class="lvt"><tbody>
-    <tr><td>Gun bias dr</td><td class="est" id="sm-gdr">—</td><td class="tru" id="sm-gdrt">—</td></tr>
-    <tr><td>Gun bias cr</td><td class="est" id="sm-gcr">—</td><td class="tru" id="sm-gcrt">—</td></tr>
-    <tr><td>Wind error dr</td><td class="est" id="sm-wdr">—</td><td class="tru" id="sm-wdrt">—</td></tr>
-    <tr><td>Wind error cr</td><td class="est" id="sm-wcr">—</td><td class="tru" id="sm-wcrt">—</td></tr>
+    <tr><td>Downrange (m)</td><td class="est" id="sm-tdr">—</td><td class="tru" id="sm-tdrt">—</td></tr>
+    <tr><td>Cross (m)</td><td class="est" id="sm-tcr">—</td><td class="tru" id="sm-tcrt">—</td></tr>
   </tbody></table>
+  <div class="legend" style="margin-top:4px"><span style="color:var(--muted)">total = gun bias + met error (combined; not split — unrecoverable per shot)</span></div>
   <div class="ttl" style="margin-top:12px">Shot-by-shot · impacts walking in</div>
   <table class="shottbl"><thead><tr><th>#</th><th>phase</th><th>dr</th><th>cr</th><th>miss</th><th></th></tr></thead>
     <tbody id="sm-shots"></tbody></table>
@@ -825,7 +822,7 @@ function showUnreachable(data){
   if(viewMode==='2d') draw2D();
 }
 function fillLearnedBlank(){
-  ['l-gdr','l-gcr','l-wdr','l-wcr','l-gdrt','l-gcrt','l-wdrt','l-wcrt'].forEach(id=>$(id).textContent='—');
+  ['l-tdr','l-tcr','l-tdrt','l-tcrt'].forEach(id=>$(id).textContent='—');
 }
 
 const ROUND_MS = 1500, PAUSE_MS = 420;
@@ -903,8 +900,7 @@ function fillSummary(){
   const m=mission.mission, L=mission.learned, R=m.target_range, rounds=mission.rounds;
   const open = rounds.length ? rounds[0].miss_m : 0;
   const fin  = (m.final_miss_m!=null) ? m.final_miss_m : (rounds.length?rounds[rounds.length-1].miss_m:0);
-  const gb = Math.hypot(L.gun_bias_est[0], L.gun_bias_est[1]);
-  const we = Math.hypot(L.atmo_correction_est[0], L.atmo_correction_est[1]);
+  const tc = Math.hypot(L.total_correction_est[0], L.total_correction_est[1]);
   $('sm-outcome').innerHTML = m.destroyed
     ? '<span style="color:var(--hit)">◎ destroyed</span>'
     : '<span style="color:var(--warn)">✕ safety cap</span>';
@@ -912,15 +908,13 @@ function fillSummary(){
                                            : (m.rounds_fired+' (cap '+m.max_rounds+')');
   $('sm-conv').innerHTML = Math.round(open)+' m → <b style="color:var(--hit)">'+fin.toFixed(1)+' m</b>';
   $('sm-factor').textContent = (fin>0 ? (open/fin).toFixed(0)+'× tighter' : '—');
-  $('sm-gdr').textContent=L.gun_bias_est[0].toFixed(1);   $('sm-gdrt').textContent=L.gun_bias_true[0].toFixed(0);
-  $('sm-gcr').textContent=L.gun_bias_est[1].toFixed(1);   $('sm-gcrt').textContent=L.gun_bias_true[1].toFixed(0);
-  $('sm-wdr').textContent=L.atmo_correction_est[0].toFixed(2); $('sm-wdrt').textContent=L.atmo_correction_true[0].toFixed(2);
-  $('sm-wcr').textContent=L.atmo_correction_est[1].toFixed(2); $('sm-wcrt').textContent=L.atmo_correction_true[1].toFixed(2);
+  $('sm-tdr').textContent=L.total_correction_est[0].toFixed(1); $('sm-tdrt').textContent=L.total_correction_true[0].toFixed(1);
+  $('sm-tcr').textContent=L.total_correction_est[1].toFixed(1); $('sm-tcrt').textContent=L.total_correction_true[1].toFixed(1);
   $('sumInsight').textContent = (m.destroyed
       ? 'Destroyed in '+m.destroying_round+' round'+(m.destroying_round===1?'':'s')
       : 'Not destroyed within '+m.max_rounds+' rounds')
-    + ' — learned a '+gb.toFixed(0)+' m gun bias and '+we.toFixed(1)
-    + ' m/s wind error from fall of shot alone.';
+    + ' — learned a '+tc.toFixed(0)+' m total correction (gun bias + met error) '
+    + 'from fall of shot, cancelled in one Newton step.';
   // shot-by-shot: impacts walking in toward the target across the phases
   const maxMiss = Math.max(1, ...rounds.map(r=>r.miss_m));
   $('sm-shots').innerHTML = rounds.map(r=>{
@@ -989,10 +983,8 @@ function setPhaseChip(id, phase){
     phase.replace('FIRE_FOR_EFFECT','FFE').replace('REGISTRATION','REG').replace('ADJUSTMENT','ADJ')+'</span>';
 }
 function fillLearned(L){
-  $('l-gdr').textContent=L.gun_bias_est[0].toFixed(1); $('l-gdrt').textContent=L.gun_bias_true[0].toFixed(0);
-  $('l-gcr').textContent=L.gun_bias_est[1].toFixed(1); $('l-gcrt').textContent=L.gun_bias_true[1].toFixed(0);
-  $('l-wdr').textContent=L.atmo_correction_est[0].toFixed(2); $('l-wdrt').textContent=L.atmo_correction_true[0].toFixed(2);
-  $('l-wcr').textContent=L.atmo_correction_est[1].toFixed(2); $('l-wcrt').textContent=L.atmo_correction_true[1].toFixed(2);
+  $('l-tdr').textContent=L.total_correction_est[0].toFixed(1); $('l-tdrt').textContent=L.total_correction_true[0].toFixed(1);
+  $('l-tcr').textContent=L.total_correction_est[1].toFixed(1); $('l-tcrt').textContent=L.total_correction_true[1].toFixed(1);
 }
 function setMissionState(kind, txt){
   $('msDot').className = 'dot '+(kind||''); $('msTxt').textContent = txt;

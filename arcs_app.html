@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ARCS Fire-Control Simulation</title>
+<style>
+  :root{
+    --navy:#0a0e1a; --panel:#0e1626; --line:#1c2a44;
+    --cyan:#00e5ff; --green:#36f08a; --ink:#cfe3f7; --muted:#6f8bb0;
+    --bar:52px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--navy);color:var(--ink);
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+  .bar{position:fixed;top:0;left:0;right:0;height:var(--bar);z-index:10;
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+    padding:0 max(16px,env(safe-area-inset-right,0px)) 0 max(16px,env(safe-area-inset-left,0px));
+    background:rgba(10,14,26,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+  .brand b{color:#eaf4ff;font-size:15px;letter-spacing:.12em}
+  .brand span{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .switch{position:relative;display:grid;grid-template-columns:1fr 1fr;
+    background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:3px;flex:none}
+  .switch button{position:relative;z-index:1;border:0;background:none;color:var(--muted);
+    font:inherit;font-size:12px;letter-spacing:.06em;padding:7px 16px;border-radius:999px;cursor:pointer;
+    transition:color .25s}
+  .switch button[aria-selected="true"]{color:var(--navy);font-weight:700}
+  .switch button:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+  .knob{position:absolute;top:3px;bottom:3px;left:3px;width:calc(50% - 3px);border-radius:999px;
+    background:linear-gradient(90deg,var(--cyan),var(--green));transition:transform .3s cubic-bezier(.3,.9,.3,1.1)}
+  .switch[data-active="simulation"] .knob{transform:translateX(100%)}
+  .views{position:fixed;top:var(--bar);left:0;right:0;bottom:0}
+  iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--navy)}
+  iframe[hidden]{display:none}
+  .hint{position:fixed;right:16px;bottom:14px;z-index:10;font-size:11px;color:var(--muted);
+    background:rgba(14,22,38,.9);border:1px solid var(--line);padding:6px 10px;border-radius:6px;
+    opacity:0;transition:opacity .4s;pointer-events:none}
+  .hint.show{opacity:1}
+  @media (max-width:560px){.brand span{display:none}.switch button{padding:7px 11px}}
+  @media (prefers-reduced-motion:reduce){.knob,.hint{transition:none}}
+</style>
+</head>
+<body>
+<div class="bar">
+  <div class="brand"><b>ARCS</b><span>Fire-control simulation · L&amp;T Precision Engineering &amp; Systems</span></div>
+  <div class="switch" id="sw" role="tablist" aria-label="Choose view" data-active="simulation">
+    <span class="knob" aria-hidden="true"></span>
+    <button type="button" role="tab" id="t-dashboard" data-view="dashboard" aria-controls="v-dashboard" aria-selected="false">Dashboard</button>
+    <button type="button" role="tab" id="t-simulation" data-view="simulation" aria-controls="v-simulation" aria-selected="true">3D Simulation</button>
+  </div>
+</div>
+<div class="views">
+  <iframe id="v-simulation" title="3D mission simulation" src="/p2/sim" role="tabpanel" aria-labelledby="t-simulation"></iframe>
+  <iframe id="v-dashboard" title="Engagement dashboard" role="tabpanel" aria-labelledby="t-dashboard" hidden></iframe>
+</div>
+<div class="hint" id="hint">Run a mission in 3D Simulation, then switch to Dashboard to analyse it</div>
+<script>
+(function(){
+  var sw=document.getElementById('sw'), hint=document.getElementById('hint');
+  var frames={dashboard:document.getElementById('v-dashboard'),simulation:document.getElementById('v-simulation')};
+  var src={dashboard:'/p2',simulation:'/p2/sim'};
+  function show(view){
+    if(!frames[view]) view='simulation';
+    var f=frames[view];
+    if(!f.getAttribute('src')) f.setAttribute('src',src[view]);
+    Object.keys(frames).forEach(function(k){
+      frames[k].hidden=(k!==view);
+      document.getElementById('t-'+k).setAttribute('aria-selected',k===view?'true':'false');
+    });
+    sw.setAttribute('data-active',view);
+    if(location.hash!=='#'+view) history.replaceState(null,'','#'+view);
+  }
+  sw.addEventListener('click',function(e){var b=e.target.closest('button');if(b)show(b.getAttribute('data-view'));});
+  sw.addEventListener('keydown',function(e){
+    if(e.key==='ArrowLeft'||e.key==='ArrowRight'){
+      var v=sw.getAttribute('data-active')==='dashboard'?'simulation':'dashboard';
+      show(v);document.getElementById('t-'+v).focus();e.preventDefault();
+    }
+  });
+  window.addEventListener('hashchange',function(){show(location.hash.slice(1));});
+  show(location.hash.slice(1)||'simulation');
+  setTimeout(function(){hint.classList.add('show');},1200);
+  setTimeout(function(){hint.classList.remove('show');},7500);
+})();
+</script>
+</body>
+</html>

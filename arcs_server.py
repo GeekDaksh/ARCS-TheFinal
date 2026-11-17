@@ -24,7 +24,8 @@ from physics import trajectory as _p2traj
 from physics.trajectory import integrate_trajectory
 from physics.met_message import MetMessage, wind_vector_from_dir_speed
 from physics.engagement import (run_engagement, run_engagement_until_destroyed,
-                                _save_gun_bias, _ensure_phase2_columns)
+                                _save_gun_bias, _ensure_phase2_columns,
+                                true_total_offset)
 from physics.horizontal_met import HorizontalMetField, weather_profile_along_path
 from engagement_database import EngagementDatabase
 
@@ -47,6 +48,13 @@ print(f"  Robot bias       : {_bias.summary()}")
 
 @app.route("/")
 def index():
+    resp = make_response(send_from_directory(".", "arcs_app.html"))
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.route("/p1")
+def p1_index():
     resp = make_response(send_from_directory(".", "arcs_simulation.html"))
     resp.headers["Cache-Control"] = "no-cache"
     return resp
@@ -263,6 +271,10 @@ def p2_engagement():
         "final_cep": (float(res["final_cep"]) if res["final_cep"] is not None else None),
         "rounds_to_converge": int(res["rounds_to_converge"]),
         "total_shots": int(res["total_shots"]),
+        # Honest telemetry: the TOTAL correction learned (dr, cr), valid because
+        # met is stable; the gun/wind split is no longer claimed (unrecoverable).
+        "total_correction_est": [float(x) for x in res["total_correction_est"]],
+        "total_correction_true": [float(x) for x in res["total_correction_true"]],
         "gun_bias_est": [float(x) for x in res["gun_bias_est"]],
         "gun_bias_true": [gun_dr, gun_cr],
         "atmo_correction_est": [float(x) for x in res["atmo_correction_est"]],
@@ -310,8 +322,11 @@ def build_mission(d):
     true_met = _met_from_wind(true_dir, true_spd)
     true_conditions = {"true_met": true_met, "gun_bias": (gun_dr, gun_cr)}
 
-    # warm_start: hand the loop a DB that already remembers this gun's bias, so
-    # Component 9 skips registration (a remembered weapon). Temp DB, cleaned up.
+    # warm_start: hand the loop a DB that already remembers this weapon's TOTAL
+    # correction (gun bias + met error) from a prior mission under the same stable
+    # met, so it fires for effect on the first round (a remembered weapon). Temp
+    # DB, cleaned up. The remembered quantity is the total offset, not gun bias
+    # alone — that is what the loop actually learns and persists in the redesign.
     db = None
     db_path = None
     if warm_start:
@@ -319,7 +334,10 @@ def build_mission(d):
         os.close(fd)
         db = EngagementDatabase(db_path)
         _ensure_phase2_columns(db)
-        _save_gun_bias(db, weapon_id, "155mm-M107", (gun_dr, gun_cr), 1, 0)
+        remembered = true_total_offset(target_range, target_bearing, told_met,
+                                       true_met, (gun_dr, gun_cr),
+                                       target_height_m=target_height_m)
+        _save_gun_bias(db, weapon_id, "155mm-M107", remembered, 1, 0)
 
     try:
         res = run_engagement_until_destroyed(
@@ -414,6 +432,14 @@ def build_mission(d):
         },
         "rounds": rounds,
         "learned": {
+            # Honest telemetry: the TOTAL correction learned (downrange, cross),
+            # valid because met is stable over the engagement. We no longer claim
+            # to split gun bias vs wind error from the impacts (unrecoverable per
+            # shot — that is why the old panel showed wind 0.0 vs 3.0).
+            "total_correction_est": [float(x) for x in res["total_correction_est"]],
+            "total_correction_true": [float(x) for x in res["total_correction_true"]],
+            # Back-compat keys retained for the API contract: gun_bias_est carries
+            # the TOTAL offset; atmo_correction_est is zero (no split claimed).
             "gun_bias_est": [float(x) for x in res["gun_bias_est"]],
             "gun_bias_true": [gun_dr, gun_cr],
             "atmo_correction_est": [float(x) for x in res["atmo_correction_est"]],
@@ -479,7 +505,8 @@ def p2_last_mission():
 if __name__ == "__main__":
     print("\n" + "=" * 52)
     print("  ARCS Simulation Server")
-    print("  Phase 1 sim : http://localhost:8766/")
+    print("  App (switch): http://localhost:8766/")
+    print("  Phase 1 sim : http://localhost:8766/p1")
     print("  Phase 2 view: http://localhost:8766/p2")
     print("=" * 52 + "\n")
-    app.run(host="0.0.0.0", port=8766, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8766)), debug=False)
